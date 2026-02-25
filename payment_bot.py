@@ -280,19 +280,20 @@ async def check_expire(context: ContextTypes.DEFAULT_TYPE):
 
 # ================= RUN =================
 
-async def main():
-    await init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("mysub", mysub))
-    app.add_handler(CallbackQueryHandler(admin_buttons))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_payment))
-
-    app.job_queue.run_repeating(check_expire, interval=3600)
-
-    print("🔥 PostgreSQL Production Bot Running...")
-    await app.run_polling()
-
 import asyncio
-asyncio.run(main())
+
+init_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(init_loop)
+init_loop.run_until_complete(init_db())
+
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("mysub", mysub))
+app.add_handler(CallbackQueryHandler(admin_buttons))
+app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_payment))
+
+app.job_queue.run_repeating(check_expire, interval=3600)
+
+print("🔥 PostgreSQL Production Bot Running...")
+app.run_polling()
