@@ -1,6 +1,6 @@
 import re
 import os
-import sqlite3
+import asyncpg
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
@@ -15,7 +15,8 @@ from telegram.ext import (
 )
 from config import BOT_TOKEN, ADMIN_GROUP_ID, CHANNEL_ID
 
-DB_FILE = "database.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+db_pool = None
 
 # ================= PORT BIND FOR RENDER =================
 
@@ -37,35 +38,30 @@ threading.Thread(target=run_web_server, daemon=True).start()
 
 # ================= DATABASE INIT =================
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        name TEXT,
-        username TEXT,
-        transaction_id TEXT UNIQUE,
-        status TEXT,
-        start_date TEXT,
-        expire_date TEXT,
-        reminder_1 INTEGER DEFAULT 0,
-        reminder_2 INTEGER DEFAULT 0,
-        created_at TEXT
-    )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON users(status)")
-    conn.commit()
-    conn.close()
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
 
-def db_execute(query, params=(), fetch=False):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(query, params)
-    result = cur.fetchall() if fetch else None
-    conn.commit()
-    conn.close()
-    return result
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            name TEXT,
+            username TEXT,
+            transaction_id TEXT UNIQUE,
+            status TEXT,
+            start_date TIMESTAMP,
+            expire_date TIMESTAMP,
+            reminder_1 BOOLEAN DEFAULT FALSE,
+            reminder_2 BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP
+        );
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_status
+        ON users(status);
+        """)
 
 # ================= START =================
 
@@ -89,26 +85,25 @@ async def mysub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
 
-    user_id = update.effective_user.id
-    result = db_execute(
-        "SELECT expire_date FROM users WHERE user_id=? AND status='active'",
-        (user_id,),
-        fetch=True
-    )
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchrow(
+            "SELECT expire_date FROM users WHERE user_id=$1 AND status='active'",
+            update.effective_user.id
+        )
 
     if not result:
         await update.message.reply_text("❌ Active subscription မရှိပါ။")
         return
 
-    expire_date = datetime.fromisoformat(result[0][0])
-    remaining = (expire_date - datetime.now()).days
+    expire_date = result["expire_date"]
+    remaining = (expire_date - datetime.utcnow()).days
 
     await update.message.reply_text(
         f"📅 Expire Date: {expire_date.date()}\n"
         f"⏳ Remaining: {remaining} days"
     )
 
-# ================= PAYMENT =================
+# ================= SMART PAYMENT =================
 
 async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -117,25 +112,57 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = re.sub(r"\s+", "", update.message.text)
 
+    # Smart validation
     if not re.fullmatch(r"\d{9}|\d{20}", text):
+        await update.message.reply_text(
+            "❌ Invalid Transaction ID.\n\n"
+            "Wave — 9 လုံး\n"
+            "Kpay — 20 လုံး\n\n"
+            "မှန်ကန်သော ID ပို့ပါ။"
+        )
         return
 
     user = update.effective_user
 
-    try:
-        db_execute("""
+    async with db_pool.acquire() as conn:
+
+        # Check duplicate transaction
+        exists = await conn.fetchrow(
+            "SELECT transaction_id FROM users WHERE transaction_id=$1",
+            text
+        )
+
+        if exists:
+            await update.message.reply_text("❌ ဒီ Transaction ID ကို အသုံးပြုပြီးသား ဖြစ်ပါတယ်။")
+            return
+
+        # Check if user already active
+        active = await conn.fetchrow(
+            "SELECT status FROM users WHERE user_id=$1 AND status='active'",
+            user.id
+        )
+
+        if active:
+            await update.message.reply_text(
+                "ℹ️ သင့်မှာ Active subscription ရှိနေပါတယ်။\n"
+                "Renew လုပ်လိုပါက Transaction ID ပို့နိုင်ပါတယ်။"
+            )
+
+        await conn.execute("""
         INSERT INTO users (user_id, name, username, transaction_id, status, created_at)
-        VALUES (?, ?, ?, ?, 'pending', ?)
-        """, (
-            user.id,
-            user.full_name,
-            user.username,
-            text,
-            datetime.now().isoformat()
-        ))
-    except sqlite3.IntegrityError:
-        await update.message.reply_text("❌ ဒီ Transaction ID ကို အသုံးပြုပြီးသား ဖြစ်ပါတယ်။")
-        return
+        VALUES ($1,$2,$3,$4,'pending',$5)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            transaction_id=EXCLUDED.transaction_id,
+            status='pending',
+            created_at=EXCLUDED.created_at
+        """,
+        user.id,
+        user.full_name,
+        user.username,
+        text,
+        datetime.utcnow()
+        )
 
     await update.message.reply_text("✅ ငွေလက်ခံပြီးပါပြီ။ Admin စစ်ဆေးနေပါသည်။")
 
@@ -162,28 +189,30 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "approve":
 
-        now = datetime.now()
-        existing = db_execute(
-            "SELECT expire_date FROM users WHERE user_id=?",
-            (user_id,),
-            fetch=True
-        )
+        now = datetime.utcnow()
 
-        if existing and existing[0][0]:
-            old_expire = datetime.fromisoformat(existing[0][0])
-            new_expire = old_expire + timedelta(days=30) if old_expire > now else now + timedelta(days=30)
-        else:
-            new_expire = now + timedelta(days=30)
+        async with db_pool.acquire() as conn:
 
-        db_execute("""
-        UPDATE users
-        SET status='active',
-            start_date=?,
-            expire_date=?,
-            reminder_1=0,
-            reminder_2=0
-        WHERE user_id=?
-        """, (now.isoformat(), new_expire.isoformat(), user_id))
+            existing = await conn.fetchrow(
+                "SELECT expire_date FROM users WHERE user_id=$1",
+                user_id
+            )
+
+            if existing and existing["expire_date"]:
+                old_expire = existing["expire_date"]
+                new_expire = old_expire + timedelta(days=30) if old_expire > now else now + timedelta(days=30)
+            else:
+                new_expire = now + timedelta(days=30)
+
+            await conn.execute("""
+            UPDATE users
+            SET status='active',
+                start_date=$1,
+                expire_date=$2,
+                reminder_1=FALSE,
+                reminder_2=FALSE
+            WHERE user_id=$3
+            """, now, new_expire, user_id)
 
         try:
             member = await context.bot.get_chat_member(CHANNEL_ID, user_id)
@@ -215,24 +244,27 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_expire(context: ContextTypes.DEFAULT_TYPE):
 
-    users = db_execute(
-        "SELECT user_id, expire_date, reminder_1, reminder_2 FROM users WHERE status='active'",
-        fetch=True
-    )
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            "SELECT user_id, expire_date, reminder_1, reminder_2 FROM users WHERE status='active'"
+        )
 
-    now = datetime.now()
+    now = datetime.utcnow()
 
-    for user_id, expire_str, r1, r2 in users:
-        expire = datetime.fromisoformat(expire_str)
+    for user in users:
+        user_id = user["user_id"]
+        expire = user["expire_date"]
         days_left = (expire - now).days
 
-        if days_left == 2 and not r2:
+        if days_left == 2 and not user["reminder_2"]:
             await context.bot.send_message(user_id, "⚠ 2 days left.")
-            db_execute("UPDATE users SET reminder_2=1 WHERE user_id=?", (user_id,))
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET reminder_2=TRUE WHERE user_id=$1", user_id)
 
-        elif days_left == 1 and not r1:
+        elif days_left == 1 and not user["reminder_1"]:
             await context.bot.send_message(user_id, "⚠ 1 day left.")
-            db_execute("UPDATE users SET reminder_1=1 WHERE user_id=?", (user_id,))
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET reminder_1=TRUE WHERE user_id=$1", user_id)
 
         elif now > expire:
             try:
@@ -241,21 +273,26 @@ async def check_expire(context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-            db_execute("UPDATE users SET status='expired' WHERE user_id=?", (user_id,))
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET status='expired' WHERE user_id=$1", user_id)
+
             await context.bot.send_message(user_id, "⛔ Subscription Expired.")
 
 # ================= RUN =================
 
-init_db()
+async def main():
+    await init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("mysub", mysub))
+    app.add_handler(CallbackQueryHandler(admin_buttons))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_payment))
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("mysub", mysub))
-app.add_handler(CallbackQueryHandler(admin_buttons))
-app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_payment))
+    app.job_queue.run_repeating(check_expire, interval=3600)
 
-app.job_queue.run_repeating(check_expire, interval=3600)
+    print("🔥 PostgreSQL Production Bot Running...")
+    await app.run_polling()
 
-print("🔥 SQLite Subscription Bot Running (Render Ready)...")
-app.run_polling()
+import asyncio
+asyncio.run(main())
