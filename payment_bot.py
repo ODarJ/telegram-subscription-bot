@@ -1,5 +1,8 @@
 import re
+import os
 import sqlite3
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,6 +16,24 @@ from telegram.ext import (
 from config import BOT_TOKEN, ADMIN_GROUP_ID, CHANNEL_ID
 
 DB_FILE = "database.db"
+
+# ================= PORT BIND FOR RENDER =================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        return
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_web_server, daemon=True).start()
 
 # ================= DATABASE INIT =================
 
@@ -164,7 +185,6 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WHERE user_id=?
         """, (now.isoformat(), new_expire.isoformat(), user_id))
 
-        # Check membership
         try:
             member = await context.bot.get_chat_member(CHANNEL_ID, user_id)
             already = member.status in ["member", "administrator", "creator"]
@@ -237,5 +257,5 @@ app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_p
 
 app.job_queue.run_repeating(check_expire, interval=3600)
 
-print("🔥 Professional SQLite Subscription Bot Running...")
+print("🔥 SQLite Subscription Bot Running (Render Ready)...")
 app.run_polling()
