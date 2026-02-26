@@ -296,4 +296,4 @@ app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_p
 app.job_queue.run_repeating(check_expire, interval=3600)
 
 print("🔥 PostgreSQL Production Bot Running...")
-app.run_polling()
+app.run_polling(drop_pending_updates=True)
