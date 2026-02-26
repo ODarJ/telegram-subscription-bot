@@ -76,9 +76,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📲 Kpay / Wave\n"
         "09971249026 (wyh)\n\n"
         "💳 ငွေလွဲပြီးပါက\n"
-        "Wave — (9 လုံး)\n"
-        "Kpay — (20 လုံး)\n"
-        "လုပ်ငန်းစဉ်အမှတ်ကို ပို့ပါ။"
+        "လုပ်ငန်းစဉ်အမှတ် (နံပါတ်များသာ - အနည်းဆုံး 5 လုံး) ကို ပို့ပါ။"
     )
 
 # ================= MY SUB =================
@@ -114,13 +112,11 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = re.sub(r"\s+", "", update.message.text)
 
-    # Smart validation
-    if not re.fullmatch(r"\d{9}|\d{20}", text):
+    # ✅ New validation (digits only, minimum 5 digits)
+    if not re.fullmatch(r"\d{5,}", text):
         await update.message.reply_text(
             "❌ Invalid Transaction ID.\n\n"
-            "Wave — 9 လုံး\n"
-            "Kpay — 20 လုံး\n\n"
-            "မှန်ကန်သော ID ပို့ပါ။"
+            "နံပါတ်များသာ (အနည်းဆုံး 5 လုံး) ပို့ပါ။"
         )
         return
 
@@ -128,7 +124,6 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with db_pool.acquire() as conn:
 
-        # Check duplicate transaction
         exists = await conn.fetchrow(
             "SELECT transaction_id FROM users WHERE transaction_id=$1",
             text
@@ -138,7 +133,6 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ ဒီ Transaction ID ကို အသုံးပြုပြီးသား ဖြစ်ပါတယ်။")
             return
 
-        # Check if user already active
         active = await conn.fetchrow(
             "SELECT status FROM users WHERE user_id=$1 AND status='active'",
             user.id
@@ -180,12 +174,12 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ================= ADMIN =================
+
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = update.callback_query
     await query.answer()
 
-    # ✅ Allow only admin group
     if update.effective_chat.id != ADMIN_GROUP_ID:
         return
 
@@ -269,6 +263,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await query.edit_message_text("❌ Rejected ✖")
+
 # ================= EXPIRE CHECK =================
 
 async def check_expire(context: ContextTypes.DEFAULT_TYPE):
