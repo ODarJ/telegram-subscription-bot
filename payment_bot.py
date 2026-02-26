@@ -180,14 +180,27 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ================= ADMIN =================
-
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = update.callback_query
     await query.answer()
 
+    # ✅ Allow only admin group
+    if update.effective_chat.id != ADMIN_GROUP_ID:
+        return
+
     action, user_id = query.data.split("_")
     user_id = int(user_id)
+
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT transaction_id FROM users WHERE user_id=$1",
+            user_id
+        )
+
+    if not user:
+        await query.edit_message_text("❌ User not found.")
+        return
 
     if action == "approve":
 
@@ -242,6 +255,20 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text("✅ Approved ✔")
 
+    elif action == "reject":
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET status='rejected' WHERE user_id=$1",
+                user_id
+            )
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ Payment Rejected.\nAdmin ကိုဆက်သွယ်ပါ။"
+        )
+
+        await query.edit_message_text("❌ Rejected ✖")
 # ================= EXPIRE CHECK =================
 
 async def check_expire(context: ContextTypes.DEFAULT_TYPE):
