@@ -2,7 +2,6 @@ import re
 import os
 import asyncpg
 import threading
-import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,15 +15,12 @@ from telegram.ext import (
 )
 from config import BOT_TOKEN, ADMIN_GROUP_ID, CHANNEL_ID
 
-logging.basicConfig(level=logging.INFO)
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set!")
-
 db_pool = None
 
-# ================= HEALTH CHECK =================
+# ================= PORT BIND FOR RENDER =================
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -44,13 +40,9 @@ threading.Thread(target=run_web_server, daemon=True).start()
 
 # ================= DATABASE INIT =================
 
-async def init_db(app):
+async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=5
-    )
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -68,19 +60,26 @@ async def init_db(app):
         );
         """)
 
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON users(status);")
-
-# ================= ERROR HANDLER =================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error(msg="Exception while handling update:", exc_info=context.error)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_status
+        ON users(status);
+        """)
 
 # ================= START =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    await update.message.reply_text("👋 Subscription Bot မှ ကြိုဆိုပါတယ်။")
+    await update.message.reply_text(
+        "👋 ကြိုဆိုပါတယ်!\n\n"
+        "💰 Channel ဝင်ကြေး — ၁၀၀၀ ကျပ် (30 days)\n"
+        "📲 Kpay / Wave\n"
+        "09971249026 (wyh)\n\n"
+        "💳 ငွေလွဲပြီးပါက\n"
+        "Wave — (9 လုံး)\n"
+        "Kpay — (20 လုံး)\n"
+        "လုပ်ငန်းစဉ်အမှတ်ကို ပို့ပါ။"
+    )
 
 # ================= MY SUB =================
 
@@ -99,12 +98,177 @@ async def mysub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     expire_date = result["expire_date"]
-    remaining = max((expire_date - datetime.utcnow()).days, 0)
+    remaining = (expire_date - datetime.utcnow()).days
 
     await update.message.reply_text(
-        f"📅 Expire: {expire_date.date()}\n⏳ Remaining: {remaining} days"
+        f"📅 Expire Date: {expire_date.date()}\n"
+        f"⏳ Remaining: {remaining} days"
     )
 
+# ================= SMART PAYMENT =================
+
+async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if update.effective_chat.type != "private":
+        return
+
+    text = re.sub(r"\s+", "", update.message.text)
+
+    # Smart validation
+    if not re.fullmatch(r"\d{9}|\d{20}", text):
+        await update.message.reply_text(
+            "❌ Invalid Transaction ID.\n\n"
+            "Wave — 9 လုံး\n"
+            "Kpay — 20 လုံး\n\n"
+            "မှန်ကန်သော ID ပို့ပါ။"
+        )
+        return
+
+    user = update.effective_user
+
+    async with db_pool.acquire() as conn:
+
+        # Check duplicate transaction
+        exists = await conn.fetchrow(
+            "SELECT transaction_id FROM users WHERE transaction_id=$1",
+            text
+        )
+
+        if exists:
+            await update.message.reply_text("❌ ဒီ Transaction ID ကို အသုံးပြုပြီးသား ဖြစ်ပါတယ်။")
+            return
+
+        # Check if user already active
+        active = await conn.fetchrow(
+            "SELECT status FROM users WHERE user_id=$1 AND status='active'",
+            user.id
+        )
+
+        if active:
+            await update.message.reply_text(
+                "ℹ️ သင့်မှာ Active subscription ရှိနေပါတယ်။\n"
+                "Renew လုပ်လိုပါက Transaction ID ပို့နိုင်ပါတယ်။"
+            )
+
+        await conn.execute("""
+        INSERT INTO users (user_id, name, username, transaction_id, status, created_at)
+        VALUES ($1,$2,$3,$4,'pending',$5)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            transaction_id=EXCLUDED.transaction_id,
+            status='pending',
+            created_at=EXCLUDED.created_at
+        """,
+        user.id,
+        user.full_name,
+        user.username,
+        text,
+        datetime.utcnow()
+        )
+
+    await update.message.reply_text("✅ ငွေလက်ခံပြီးပါပြီ။ Admin စစ်ဆေးနေပါသည်။")
+
+    keyboard = [[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user.id}")
+    ]]
+
+    await context.bot.send_message(
+        chat_id=ADMIN_GROUP_ID,
+        text=f"💳 New Payment\n👤 {user.full_name}\n🆔 {user.id}\nID: {text}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ================= ADMIN =================
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    query = update.callback_query
+    await query.answer()
+
+    # ✅ Allow only admin group
+    if update.effective_chat.id != ADMIN_GROUP_ID:
+        return
+
+    action, user_id = query.data.split("_")
+    user_id = int(user_id)
+
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT transaction_id FROM users WHERE user_id=$1",
+            user_id
+        )
+
+    if not user:
+        await query.edit_message_text("❌ User not found.")
+        return
+
+    if action == "approve":
+
+        now = datetime.utcnow()
+
+        async with db_pool.acquire() as conn:
+
+            existing = await conn.fetchrow(
+                "SELECT expire_date FROM users WHERE user_id=$1",
+                user_id
+            )
+
+            if existing and existing["expire_date"]:
+                old_expire = existing["expire_date"]
+                new_expire = old_expire + timedelta(days=30) if old_expire > now else now + timedelta(days=30)
+            else:
+                new_expire = now + timedelta(days=30)
+
+            await conn.execute("""
+            UPDATE users
+            SET status='active',
+                start_date=$1,
+                expire_date=$2,
+                reminder_1=FALSE,
+                reminder_2=FALSE
+            WHERE user_id=$3
+            """, now, new_expire, user_id)
+
+        try:
+            member = await context.bot.get_chat_member(CHANNEL_ID, user_id)
+            already = member.status in ["member", "administrator", "creator"]
+        except:
+            already = False
+
+        if already:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Renewed!\nExpire: {new_expire.date()}"
+            )
+        else:
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=CHANNEL_ID,
+                member_limit=1
+            )
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🎉 Approved!\nExpire: {new_expire.date()}",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔓 Join Channel", url=invite.invite_link)]]
+                )
+            )
+
+        await query.edit_message_text("✅ Approved ✔")
+
+    elif action == "reject":
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET status='rejected' WHERE user_id=$1",
+                user_id
+            )
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ Payment Rejected.\nAdmin ကိုဆက်သွယ်ပါ။"
+        )
+
+        await query.edit_message_text("❌ Rejected ✖")
 # ================= EXPIRE CHECK =================
 
 async def check_expire(context: ContextTypes.DEFAULT_TYPE):
@@ -121,39 +285,37 @@ async def check_expire(context: ContextTypes.DEFAULT_TYPE):
         expire = user["expire_date"]
         days_left = (expire - now).days
 
-        try:
-            if days_left == 2 and not user["reminder_2"]:
-                await context.bot.send_message(user_id, "⚠ 2 days left.")
-                async with db_pool.acquire() as conn:
-                    await conn.execute("UPDATE users SET reminder_2=TRUE WHERE user_id=$1", user_id)
+        if days_left == 2 and not user["reminder_2"]:
+            await context.bot.send_message(user_id, "⚠ 2 days left.")
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET reminder_2=TRUE WHERE user_id=$1", user_id)
 
-            elif days_left == 1 and not user["reminder_1"]:
-                await context.bot.send_message(user_id, "⚠ 1 day left.")
-                async with db_pool.acquire() as conn:
-                    await conn.execute("UPDATE users SET reminder_1=TRUE WHERE user_id=$1", user_id)
+        elif days_left == 1 and not user["reminder_1"]:
+            await context.bot.send_message(user_id, "⚠ 1 day left.")
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET reminder_1=TRUE WHERE user_id=$1", user_id)
 
-            elif days_left < 0:
+        elif now > expire:
+            try:
                 await context.bot.ban_chat_member(CHANNEL_ID, user_id)
                 await context.bot.unban_chat_member(CHANNEL_ID, user_id)
+            except:
+                pass
 
-                async with db_pool.acquire() as conn:
-                    await conn.execute("UPDATE users SET status='expired' WHERE user_id=$1", user_id)
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET status='expired' WHERE user_id=$1", user_id)
 
-                await context.bot.send_message(user_id, "⛔ Subscription Expired.")
-
-        except Exception as e:
-            logging.error(f"Expire error for {user_id}: {e}")
+            await context.bot.send_message(user_id, "⛔ Subscription Expired.")
 
 # ================= RUN =================
 
-app = (
-    ApplicationBuilder()
-    .token(BOT_TOKEN)
-    .post_init(init_db)
-    .build()
-)
+import asyncio
 
-app.add_error_handler(error_handler)
+init_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(init_loop)
+init_loop.run_until_complete(init_db())
+
+app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("mysub", mysub))
@@ -162,5 +324,5 @@ app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_p
 
 app.job_queue.run_repeating(check_expire, interval=3600)
 
-print("🔥 Production Bot Running...")
+print("🔥 PostgreSQL Production Bot Running...")
 app.run_polling(drop_pending_updates=True)
