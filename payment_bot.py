@@ -16,6 +16,8 @@ from telegram.ext import (
 from config import BOT_TOKEN, ADMIN_GROUP_ID, CHANNEL_ID
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set!")
 db_pool = None
 
 # ================= PORT BIND FOR RENDER =================
